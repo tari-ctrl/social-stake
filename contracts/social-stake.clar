@@ -211,3 +211,108 @@
     )
   )
 )
+
+;; PRIVATE FUNCTIONS
+
+(define-private (update-reputation 
+    (user principal) 
+    (score-change int) 
+    (reason (string-ascii 50))
+  )
+  (let (
+      (current-user (default-to {
+        reputation-score: u0,
+        total-content: u0,
+        total-earnings: u0,
+        stake-amount: u0,
+        last-action-block: u0,
+        verified: false,
+        join-block: stacks-block-height,
+      }
+        (map-get? users user)
+      ))
+      (current-score (get reputation-score current-user))
+      (new-score (if (< score-change 0)
+        (if (>= current-score (to-uint (- 0 score-change)))
+          (- current-score (to-uint (- 0 score-change)))
+          u0
+        )
+        (+ current-score (to-uint score-change))
+      ))
+    )
+    (map-set users user
+      (merge current-user {
+        reputation-score: new-score,
+        last-action-block: stacks-block-height,
+      })
+    )
+    (map-set reputation-history {
+      user: user,
+      block: stacks-block-height,
+    } {
+      old-score: current-score,
+      new-score: new-score,
+      reason: reason,
+    })
+    (ok new-score)
+  )
+)
+
+(define-private (calculate-voting-weight (voter principal))
+  (let (
+      (user-data (unwrap! (map-get? users voter) u1))
+      (reputation (get reputation-score user-data))
+      (stake-amount (get stake-amount user-data))
+    )
+    (+ u1 (/ reputation u100) (/ stake-amount u1000000))
+    ;; Base weight + reputation + stake bonuses
+  )
+)
+
+(define-private (distribute-content-rewards (content-id uint))
+  (let (
+      (content-data (unwrap! (map-get? content content-id) err-not-found))
+      (creator (get creator content-data))
+      (quality-score (get quality-score content-data))
+      (total-votes (get total-votes content-data))
+      (reward-amount (/ (* quality-score (var-get content-reward-pool)) u10000))
+    )
+    (if (and (> reward-amount u0) (not (get reward-claimed content-data)))
+      (begin
+        (unwrap! (as-contract (stx-transfer? reward-amount tx-sender creator))
+          err-insufficient-funds
+        )
+        (map-set content content-id (merge content-data { reward-claimed: true }))
+        (var-set content-reward-pool
+          (- (var-get content-reward-pool) reward-amount)
+        )
+        (unwrap!
+          (update-reputation creator (to-int (/ quality-score u10))
+            "content-reward"
+          )
+          err-owner-only
+        )
+        (ok reward-amount)
+      )
+      (ok u0)
+    )
+  )
+)
+
+;; PUBLIC FUNCTIONS
+
+(define-public (register-user)
+  (let ((existing-user (map-get? users tx-sender)))
+    (asserts! (is-none existing-user) err-already-exists)
+    (map-set users tx-sender {
+      reputation-score: u100, ;; Starting reputation
+      total-content: u0,
+      total-earnings: u0,
+      stake-amount: u0,
+      last-action-block: stacks-block-height,
+      verified: false,
+      join-block: stacks-block-height,
+    })
+    (ok true)
+  )
+)
