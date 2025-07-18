@@ -316,3 +316,111 @@
     (ok true)
   )
 )
+
+(define-public (stake-tokens (amount uint))
+  (let (
+      (user-data (unwrap! (map-get? users tx-sender) err-not-found))
+      (current-stake (get stake-amount user-data))
+    )
+    (asserts! (validate-amount amount) err-invalid-input)
+    (asserts! (>= amount (var-get min-stake-amount)) err-invalid-amount)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (map-set users tx-sender
+      (merge user-data {
+        stake-amount: (+ current-stake amount),
+        last-action-block: stacks-block-height,
+      })
+    )
+    (unwrap!
+      (update-reputation tx-sender (to-int (/ amount u100000)) "stake-increase")
+      err-owner-only
+    )
+    (ok amount)
+  )
+)
+
+(define-public (unstake-tokens (amount uint))
+  (let (
+      (user-data (unwrap! (map-get? users tx-sender) err-not-found))
+      (current-stake (get stake-amount user-data))
+    )
+    (asserts! (validate-amount amount) err-invalid-input)
+    (asserts! (>= current-stake amount) err-insufficient-funds)
+    (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+    (map-set users tx-sender
+      (merge user-data {
+        stake-amount: (- current-stake amount),
+        last-action-block: stacks-block-height,
+      })
+    )
+    (ok amount)
+  )
+)
+
+(define-public (create-content
+    (content-hash (string-ascii 64))
+    (title (string-utf8 100))
+    (category (string-ascii 20))
+    (stake-backing uint)
+  )
+  (let (
+      (user-data (unwrap! (map-get? users tx-sender) err-not-found))
+      (content-id (+ (var-get content-id-nonce) u1))
+      (user-stake (get stake-amount user-data))
+    )
+    (asserts! (var-get contract-enabled) err-unauthorized)
+    (asserts! (> (get stake-amount user-data) u0) err-stake-required)
+    (asserts! (>= user-stake stake-backing) err-insufficient-funds)
+    (asserts! (validate-amount stake-backing) err-invalid-input)
+    (asserts! (validate-content-hash content-hash) err-invalid-input)
+    (asserts! (validate-title title) err-invalid-input)
+    (asserts! (validate-category category) err-invalid-input)
+    
+    (var-set content-id-nonce content-id)
+    (map-set content content-id {
+      creator: tx-sender,
+      content-hash: content-hash,
+      title: title,
+      category: category,
+      timestamp: stacks-block-height,
+      total-votes: u0,
+      positive-votes: u0,
+      quality-score: u0,
+      reward-claimed: false,
+      stake-backing: stake-backing,
+    })
+    (map-set users tx-sender
+      (merge user-data {
+        total-content: (+ (get total-content user-data) u1),
+        stake-amount: (- user-stake stake-backing),
+        last-action-block: stacks-block-height,
+      })
+    )
+    (unwrap! (update-reputation tx-sender 10 "content-creation") err-owner-only)
+    (ok content-id)
+  )
+)
+
+(define-public (vote-content (content-id uint) (vote-positive bool))
+  (let (
+      (content-data (unwrap! (map-get? content content-id) err-not-found))
+      (voter-data (unwrap! (map-get? users tx-sender) err-not-found))
+      (creator (get creator content-data))
+      (existing-vote (map-get? votes {
+        content-id: content-id,
+        voter: tx-sender,
+      }))
+      (voting-weight (calculate-voting-weight tx-sender))
+      (current-total (get total-votes content-data))
+      (current-positive (get positive-votes content-data))
+    )
+    (asserts! (var-get contract-enabled) err-unauthorized)
+    (asserts! (not (is-eq tx-sender creator)) err-self-interaction)
+    (asserts! (is-none existing-vote) err-already-voted)
+    (asserts! (> (get stake-amount voter-data) u0) err-stake-required)
+    (asserts! (validate-content-id content-id) err-invalid-input)
+    
+    ;; Record the vote
+    (map-set votes {
+      content-id: content-id,
+      voter: tx-sender,
