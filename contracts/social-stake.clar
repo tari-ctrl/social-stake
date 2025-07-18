@@ -1,0 +1,556 @@
+;; SocialStake - Decentralized Social Media Protocol
+;;
+;; Summary:
+;; Revolutionary blockchain-based social platform where content quality drives rewards.
+;; Users stake tokens to publish, earn through peer validation, and build verifiable 
+;; social reputation secured by Bitcoin's immutable ledger.
+;;
+;; Description:
+;; SocialStake transforms social media economics through decentralized incentives and 
+;; transparent reputation systems. Built on Stacks blockchain with Bitcoin security, 
+;; the protocol rewards high-quality content creation and curation while preventing 
+;; spam and manipulation. Users must stake tokens to participate, creating skin-in-the-game 
+;; dynamics that naturally filter content quality. The peer-to-peer voting mechanism 
+;; distributes rewards based on community consensus, while algorithmic reputation scoring 
+;; ensures long-term platform integrity. Features include stake-weighted voting, 
+;; follower networks, reward pooling, and administrative controls for platform governance.
+
+;; CONSTANTS & ERROR CODES
+
+(define-constant contract-owner tx-sender)
+(define-constant err-owner-only (err u100))
+(define-constant err-not-found (err u101))
+(define-constant err-already-exists (err u102))
+(define-constant err-insufficient-funds (err u103))
+(define-constant err-unauthorized (err u104))
+(define-constant err-invalid-amount (err u105))
+(define-constant err-self-interaction (err u106))
+(define-constant err-already-voted (err u107))
+(define-constant err-invalid-score (err u108))
+(define-constant err-stake-required (err u109))
+(define-constant err-cooldown-active (err u110))
+(define-constant err-invalid-input (err u111))
+
+;; DATA VARIABLES
+
+(define-data-var contract-enabled bool true)
+(define-data-var min-stake-amount uint u1000000) ;; 1 STX in microSTX
+(define-data-var reputation-multiplier uint u100)
+(define-data-var content-reward-pool uint u0)
+(define-data-var platform-fee-rate uint u50) ;; 0.5% (50/10000)
+
+;; DATA MAPS
+
+(define-map users
+  principal
+  {
+    reputation-score: uint,
+    total-content: uint,
+    total-earnings: uint,
+    stake-amount: uint,
+    last-action-block: uint,
+    verified: bool,
+    join-block: uint,
+  }
+)
+
+(define-map content
+  uint
+  {
+    creator: principal,
+    content-hash: (string-ascii 64),
+    title: (string-utf8 100),
+    category: (string-ascii 20),
+    timestamp: uint,
+    total-votes: uint,
+    positive-votes: uint,
+    quality-score: uint,
+    reward-claimed: bool,
+    stake-backing: uint,
+  }
+)
+
+(define-map votes
+  {
+    content-id: uint,
+    voter: principal,
+  }
+  {
+    vote-type: bool, ;; true for upvote, false for downvote
+    stake-weight: uint,
+    timestamp: uint,
+  }
+)
+
+(define-map user-following
+  {
+    follower: principal,
+    following: principal,
+  }
+  bool
+)
+
+(define-map reputation-history
+  {
+    user: principal,
+    block: uint,
+  }
+  {
+    old-score: uint,
+    new-score: uint,
+    reason: (string-ascii 50),
+  }
+)
+
+;; SEQUENCE COUNTERS
+
+(define-data-var content-id-nonce uint u0)
+
+;; INPUT VALIDATION FUNCTIONS
+
+(define-private (validate-content-hash (hash (string-ascii 64)))
+  (let ((hash-len (len hash)))
+    (and (>= hash-len u32) (<= hash-len u64))
+  )
+)
+
+(define-private (validate-title (title (string-utf8 100)))
+  (let ((title-len (len title)))
+    (and (>= title-len u1) (<= title-len u100))
+  )
+)
+
+(define-private (validate-category (category (string-ascii 20)))
+  (let ((category-len (len category)))
+    (and (>= category-len u1) (<= category-len u20))
+  )
+)
+
+(define-private (validate-content-id (content-id uint))
+  (and (> content-id u0) (<= content-id (var-get content-id-nonce)))
+)
+
+(define-private (validate-amount (amount uint))
+  (and (> amount u0) (<= amount u1000000000000)) ;; Reasonable upper limit
+)
+
+(define-private (validate-user (user principal))
+  (is-some (map-get? users user))
+)
+
+;; READ-ONLY FUNCTIONS
+
+(define-read-only (get-contract-info)
+  {
+    enabled: (var-get contract-enabled),
+    min-stake: (var-get min-stake-amount),
+    reputation-multiplier: (var-get reputation-multiplier),
+    reward-pool: (var-get content-reward-pool),
+    platform-fee: (var-get platform-fee-rate),
+  }
+)
+
+(define-read-only (get-user-profile (user principal))
+  (map-get? users user)
+)
+
+(define-read-only (get-user-reputation (user principal))
+  (default-to u0 (get reputation-score (map-get? users user)))
+)
+
+(define-read-only (get-content-details (content-id uint))
+  (if (validate-content-id content-id)
+    (map-get? content content-id)
+    none
+  )
+)
+
+(define-read-only (get-vote-details (content-id uint) (voter principal))
+  (if (validate-content-id content-id)
+    (map-get? votes {
+      content-id: content-id,
+      voter: voter,
+    })
+    none
+  )
+)
+
+(define-read-only (is-following (follower principal) (following principal))
+  (default-to false
+    (map-get? user-following {
+      follower: follower,
+      following: following,
+    })
+  )
+)
+
+(define-read-only (calculate-content-quality (content-id uint))
+  (let (
+      (content-data (unwrap! (map-get? content content-id) u0))
+      (total-votes (get total-votes content-data))
+      (positive-votes (get positive-votes content-data))
+    )
+    (if (> total-votes u0)
+      (/ (* positive-votes u1000) total-votes) ;; Quality score out of 1000
+      u0
+    )
+  )
+)
+
+(define-read-only (calculate-trust-score (user principal))
+  (let (
+      (user-data (unwrap! (map-get? users user) u0))
+      (reputation (get reputation-score user-data))
+      (stake-amount (get stake-amount user-data))
+      (content-count (get total-content user-data))
+    )
+    (+ 
+      (/ reputation u10)              ;; Reputation component
+      (/ stake-amount u100000)        ;; Stake component (STX to points)
+      (* content-count u5)            ;; Content activity component
+    )
+  )
+)
+
+;; PRIVATE FUNCTIONS
+
+(define-private (update-reputation 
+    (user principal) 
+    (score-change int) 
+    (reason (string-ascii 50))
+  )
+  (let (
+      (current-user (default-to {
+        reputation-score: u0,
+        total-content: u0,
+        total-earnings: u0,
+        stake-amount: u0,
+        last-action-block: u0,
+        verified: false,
+        join-block: stacks-block-height,
+      }
+        (map-get? users user)
+      ))
+      (current-score (get reputation-score current-user))
+      (new-score (if (< score-change 0)
+        (if (>= current-score (to-uint (- 0 score-change)))
+          (- current-score (to-uint (- 0 score-change)))
+          u0
+        )
+        (+ current-score (to-uint score-change))
+      ))
+    )
+    (map-set users user
+      (merge current-user {
+        reputation-score: new-score,
+        last-action-block: stacks-block-height,
+      })
+    )
+    (map-set reputation-history {
+      user: user,
+      block: stacks-block-height,
+    } {
+      old-score: current-score,
+      new-score: new-score,
+      reason: reason,
+    })
+    (ok new-score)
+  )
+)
+
+(define-private (calculate-voting-weight (voter principal))
+  (let (
+      (user-data (unwrap! (map-get? users voter) u1))
+      (reputation (get reputation-score user-data))
+      (stake-amount (get stake-amount user-data))
+    )
+    (+ u1 (/ reputation u100) (/ stake-amount u1000000))
+    ;; Base weight + reputation + stake bonuses
+  )
+)
+
+(define-private (distribute-content-rewards (content-id uint))
+  (let (
+      (content-data (unwrap! (map-get? content content-id) err-not-found))
+      (creator (get creator content-data))
+      (quality-score (get quality-score content-data))
+      (total-votes (get total-votes content-data))
+      (reward-amount (/ (* quality-score (var-get content-reward-pool)) u10000))
+    )
+    (if (and (> reward-amount u0) (not (get reward-claimed content-data)))
+      (begin
+        (unwrap! (as-contract (stx-transfer? reward-amount tx-sender creator))
+          err-insufficient-funds
+        )
+        (map-set content content-id (merge content-data { reward-claimed: true }))
+        (var-set content-reward-pool
+          (- (var-get content-reward-pool) reward-amount)
+        )
+        (unwrap!
+          (update-reputation creator (to-int (/ quality-score u10))
+            "content-reward"
+          )
+          err-owner-only
+        )
+        (ok reward-amount)
+      )
+      (ok u0)
+    )
+  )
+)
+
+;; PUBLIC FUNCTIONS
+
+(define-public (register-user)
+  (let ((existing-user (map-get? users tx-sender)))
+    (asserts! (is-none existing-user) err-already-exists)
+    (map-set users tx-sender {
+      reputation-score: u100, ;; Starting reputation
+      total-content: u0,
+      total-earnings: u0,
+      stake-amount: u0,
+      last-action-block: stacks-block-height,
+      verified: false,
+      join-block: stacks-block-height,
+    })
+    (ok true)
+  )
+)
+
+(define-public (stake-tokens (amount uint))
+  (let (
+      (user-data (unwrap! (map-get? users tx-sender) err-not-found))
+      (current-stake (get stake-amount user-data))
+    )
+    (asserts! (validate-amount amount) err-invalid-input)
+    (asserts! (>= amount (var-get min-stake-amount)) err-invalid-amount)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (map-set users tx-sender
+      (merge user-data {
+        stake-amount: (+ current-stake amount),
+        last-action-block: stacks-block-height,
+      })
+    )
+    (unwrap!
+      (update-reputation tx-sender (to-int (/ amount u100000)) "stake-increase")
+      err-owner-only
+    )
+    (ok amount)
+  )
+)
+
+(define-public (unstake-tokens (amount uint))
+  (let (
+      (user-data (unwrap! (map-get? users tx-sender) err-not-found))
+      (current-stake (get stake-amount user-data))
+    )
+    (asserts! (validate-amount amount) err-invalid-input)
+    (asserts! (>= current-stake amount) err-insufficient-funds)
+    (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+    (map-set users tx-sender
+      (merge user-data {
+        stake-amount: (- current-stake amount),
+        last-action-block: stacks-block-height,
+      })
+    )
+    (ok amount)
+  )
+)
+
+(define-public (create-content
+    (content-hash (string-ascii 64))
+    (title (string-utf8 100))
+    (category (string-ascii 20))
+    (stake-backing uint)
+  )
+  (let (
+      (user-data (unwrap! (map-get? users tx-sender) err-not-found))
+      (content-id (+ (var-get content-id-nonce) u1))
+      (user-stake (get stake-amount user-data))
+    )
+    (asserts! (var-get contract-enabled) err-unauthorized)
+    (asserts! (> (get stake-amount user-data) u0) err-stake-required)
+    (asserts! (>= user-stake stake-backing) err-insufficient-funds)
+    (asserts! (validate-amount stake-backing) err-invalid-input)
+    (asserts! (validate-content-hash content-hash) err-invalid-input)
+    (asserts! (validate-title title) err-invalid-input)
+    (asserts! (validate-category category) err-invalid-input)
+    
+    (var-set content-id-nonce content-id)
+    (map-set content content-id {
+      creator: tx-sender,
+      content-hash: content-hash,
+      title: title,
+      category: category,
+      timestamp: stacks-block-height,
+      total-votes: u0,
+      positive-votes: u0,
+      quality-score: u0,
+      reward-claimed: false,
+      stake-backing: stake-backing,
+    })
+    (map-set users tx-sender
+      (merge user-data {
+        total-content: (+ (get total-content user-data) u1),
+        stake-amount: (- user-stake stake-backing),
+        last-action-block: stacks-block-height,
+      })
+    )
+    (unwrap! (update-reputation tx-sender 10 "content-creation") err-owner-only)
+    (ok content-id)
+  )
+)
+
+(define-public (vote-content (content-id uint) (vote-positive bool))
+  (let (
+      (content-data (unwrap! (map-get? content content-id) err-not-found))
+      (voter-data (unwrap! (map-get? users tx-sender) err-not-found))
+      (creator (get creator content-data))
+      (existing-vote (map-get? votes {
+        content-id: content-id,
+        voter: tx-sender,
+      }))
+      (voting-weight (calculate-voting-weight tx-sender))
+      (current-total (get total-votes content-data))
+      (current-positive (get positive-votes content-data))
+    )
+    (asserts! (var-get contract-enabled) err-unauthorized)
+    (asserts! (not (is-eq tx-sender creator)) err-self-interaction)
+    (asserts! (is-none existing-vote) err-already-voted)
+    (asserts! (> (get stake-amount voter-data) u0) err-stake-required)
+    (asserts! (validate-content-id content-id) err-invalid-input)
+    
+    ;; Record the vote
+    (map-set votes {
+      content-id: content-id,
+      voter: tx-sender,
+    } {
+      vote-type: vote-positive,
+      stake-weight: voting-weight,
+      timestamp: stacks-block-height,
+    })
+    
+    ;; Update content vote counts
+    (let (
+        (new-total (+ current-total voting-weight))
+        (new-positive (if vote-positive
+          (+ current-positive voting-weight)
+          current-positive
+        ))
+        (new-quality-score (if (> new-total u0)
+          (/ (* new-positive u1000) new-total)
+          u0
+        ))
+      )
+      (map-set content content-id
+        (merge content-data {
+          total-votes: new-total,
+          positive-votes: new-positive,
+          quality-score: new-quality-score,
+        })
+      )
+      
+      ;; Update creator reputation based on vote
+      (let ((reputation-change (if vote-positive
+          (to-int voting-weight)
+          (- 0 (to-int voting-weight))
+        )))
+        (unwrap! (update-reputation creator reputation-change "vote-received")
+          err-owner-only
+        )
+      )
+      
+      ;; Update voter reputation (small bonus for participation)
+      (unwrap! (update-reputation tx-sender 1 "vote-participation")
+        err-owner-only
+      )
+      (ok voting-weight)
+    )
+  )
+)
+
+(define-public (follow-user (user-to-follow principal))
+  (begin
+    (asserts! (not (is-eq tx-sender user-to-follow)) err-self-interaction)
+    (asserts! (validate-user user-to-follow) err-not-found)
+    (asserts! (is-some (map-get? users tx-sender)) err-not-found)
+    (map-set user-following {
+      follower: tx-sender,
+      following: user-to-follow,
+    }
+      true
+    )
+    (unwrap! (update-reputation user-to-follow 5 "new-follower") err-owner-only)
+    (ok true)
+  )
+)
+
+(define-public (unfollow-user (user-to-unfollow principal))
+  (begin
+    (asserts! (not (is-eq tx-sender user-to-unfollow)) err-self-interaction)
+    (map-delete user-following {
+      follower: tx-sender,
+      following: user-to-unfollow,
+    })
+    (ok true)
+  )
+)
+
+(define-public (claim-content-rewards (content-id uint))
+  (let (
+      (content-data (unwrap! (map-get? content content-id) err-not-found))
+      (creator (get creator content-data))
+    )
+    (asserts! (is-eq tx-sender creator) err-unauthorized)
+    (asserts! (not (get reward-claimed content-data)) err-unauthorized)
+    (asserts! (validate-content-id content-id) err-invalid-input)
+    (distribute-content-rewards content-id)
+  )
+)
+
+(define-public (add-to-reward-pool (amount uint))
+  (begin
+    (asserts! (validate-amount amount) err-invalid-input)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (var-set content-reward-pool (+ (var-get content-reward-pool) amount))
+    (ok amount)
+  )
+)
+
+;; ADMIN FUNCTIONS
+
+(define-public (set-contract-enabled (enabled bool))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set contract-enabled enabled)
+    (ok enabled)
+  )
+)
+
+(define-public (set-min-stake-amount (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (validate-amount amount) err-invalid-input)
+    (var-set min-stake-amount amount)
+    (ok amount)
+  )
+)
+
+(define-public (verify-user (user principal))
+  (let ((user-data (unwrap! (map-get? users user) err-not-found)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (validate-user user) err-invalid-input)
+    (map-set users user (merge user-data { verified: true }))
+    (unwrap! (update-reputation user 100 "verification") err-owner-only)
+    (ok true)
+  )
+)
+
+(define-public (emergency-withdraw (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (validate-amount amount) err-invalid-input)
+    (try! (as-contract (stx-transfer? amount tx-sender contract-owner)))
+    (ok amount)
+  )
+)
