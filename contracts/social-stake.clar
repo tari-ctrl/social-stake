@@ -101,3 +101,113 @@
     reason: (string-ascii 50),
   }
 )
+
+;; SEQUENCE COUNTERS
+
+(define-data-var content-id-nonce uint u0)
+
+;; INPUT VALIDATION FUNCTIONS
+
+(define-private (validate-content-hash (hash (string-ascii 64)))
+  (let ((hash-len (len hash)))
+    (and (>= hash-len u32) (<= hash-len u64))
+  )
+)
+
+(define-private (validate-title (title (string-utf8 100)))
+  (let ((title-len (len title)))
+    (and (>= title-len u1) (<= title-len u100))
+  )
+)
+
+(define-private (validate-category (category (string-ascii 20)))
+  (let ((category-len (len category)))
+    (and (>= category-len u1) (<= category-len u20))
+  )
+)
+
+(define-private (validate-content-id (content-id uint))
+  (and (> content-id u0) (<= content-id (var-get content-id-nonce)))
+)
+
+(define-private (validate-amount (amount uint))
+  (and (> amount u0) (<= amount u1000000000000)) ;; Reasonable upper limit
+)
+
+(define-private (validate-user (user principal))
+  (is-some (map-get? users user))
+)
+
+;; READ-ONLY FUNCTIONS
+
+(define-read-only (get-contract-info)
+  {
+    enabled: (var-get contract-enabled),
+    min-stake: (var-get min-stake-amount),
+    reputation-multiplier: (var-get reputation-multiplier),
+    reward-pool: (var-get content-reward-pool),
+    platform-fee: (var-get platform-fee-rate),
+  }
+)
+
+(define-read-only (get-user-profile (user principal))
+  (map-get? users user)
+)
+
+(define-read-only (get-user-reputation (user principal))
+  (default-to u0 (get reputation-score (map-get? users user)))
+)
+
+(define-read-only (get-content-details (content-id uint))
+  (if (validate-content-id content-id)
+    (map-get? content content-id)
+    none
+  )
+)
+
+(define-read-only (get-vote-details (content-id uint) (voter principal))
+  (if (validate-content-id content-id)
+    (map-get? votes {
+      content-id: content-id,
+      voter: voter,
+    })
+    none
+  )
+)
+
+(define-read-only (is-following (follower principal) (following principal))
+  (default-to false
+    (map-get? user-following {
+      follower: follower,
+      following: following,
+    })
+  )
+)
+
+(define-read-only (calculate-content-quality (content-id uint))
+  (let (
+      (content-data (unwrap! (map-get? content content-id) u0))
+      (total-votes (get total-votes content-data))
+      (positive-votes (get positive-votes content-data))
+    )
+    (if (> total-votes u0)
+      (/ (* positive-votes u1000) total-votes) ;; Quality score out of 1000
+      u0
+    )
+  )
+)
+
+(define-read-only (calculate-trust-score (user principal))
+  (let (
+      (user-data (unwrap! (map-get? users user) u0))
+      (reputation (get reputation-score user-data))
+      (stake-amount (get stake-amount user-data))
+      (content-count (get total-content user-data))
+    )
+    (+ 
+      (/ reputation u10)              ;; Reputation component
+      (/ stake-amount u100000)        ;; Stake component (STX to points)
+      (* content-count u5)            ;; Content activity component
+    )
+  )
+)
