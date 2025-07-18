@@ -424,3 +424,133 @@
     (map-set votes {
       content-id: content-id,
       voter: tx-sender,
+    } {
+      vote-type: vote-positive,
+      stake-weight: voting-weight,
+      timestamp: stacks-block-height,
+    })
+    
+    ;; Update content vote counts
+    (let (
+        (new-total (+ current-total voting-weight))
+        (new-positive (if vote-positive
+          (+ current-positive voting-weight)
+          current-positive
+        ))
+        (new-quality-score (if (> new-total u0)
+          (/ (* new-positive u1000) new-total)
+          u0
+        ))
+      )
+      (map-set content content-id
+        (merge content-data {
+          total-votes: new-total,
+          positive-votes: new-positive,
+          quality-score: new-quality-score,
+        })
+      )
+      
+      ;; Update creator reputation based on vote
+      (let ((reputation-change (if vote-positive
+          (to-int voting-weight)
+          (- 0 (to-int voting-weight))
+        )))
+        (unwrap! (update-reputation creator reputation-change "vote-received")
+          err-owner-only
+        )
+      )
+      
+      ;; Update voter reputation (small bonus for participation)
+      (unwrap! (update-reputation tx-sender 1 "vote-participation")
+        err-owner-only
+      )
+      (ok voting-weight)
+    )
+  )
+)
+
+(define-public (follow-user (user-to-follow principal))
+  (begin
+    (asserts! (not (is-eq tx-sender user-to-follow)) err-self-interaction)
+    (asserts! (validate-user user-to-follow) err-not-found)
+    (asserts! (is-some (map-get? users tx-sender)) err-not-found)
+    (map-set user-following {
+      follower: tx-sender,
+      following: user-to-follow,
+    }
+      true
+    )
+    (unwrap! (update-reputation user-to-follow 5 "new-follower") err-owner-only)
+    (ok true)
+  )
+)
+
+(define-public (unfollow-user (user-to-unfollow principal))
+  (begin
+    (asserts! (not (is-eq tx-sender user-to-unfollow)) err-self-interaction)
+    (map-delete user-following {
+      follower: tx-sender,
+      following: user-to-unfollow,
+    })
+    (ok true)
+  )
+)
+
+(define-public (claim-content-rewards (content-id uint))
+  (let (
+      (content-data (unwrap! (map-get? content content-id) err-not-found))
+      (creator (get creator content-data))
+    )
+    (asserts! (is-eq tx-sender creator) err-unauthorized)
+    (asserts! (not (get reward-claimed content-data)) err-unauthorized)
+    (asserts! (validate-content-id content-id) err-invalid-input)
+    (distribute-content-rewards content-id)
+  )
+)
+
+(define-public (add-to-reward-pool (amount uint))
+  (begin
+    (asserts! (validate-amount amount) err-invalid-input)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (var-set content-reward-pool (+ (var-get content-reward-pool) amount))
+    (ok amount)
+  )
+)
+
+;; ADMIN FUNCTIONS
+
+(define-public (set-contract-enabled (enabled bool))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set contract-enabled enabled)
+    (ok enabled)
+  )
+)
+
+(define-public (set-min-stake-amount (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (validate-amount amount) err-invalid-input)
+    (var-set min-stake-amount amount)
+    (ok amount)
+  )
+)
+
+(define-public (verify-user (user principal))
+  (let ((user-data (unwrap! (map-get? users user) err-not-found)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (validate-user user) err-invalid-input)
+    (map-set users user (merge user-data { verified: true }))
+    (unwrap! (update-reputation user 100 "verification") err-owner-only)
+    (ok true)
+  )
+)
+
+(define-public (emergency-withdraw (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (validate-amount amount) err-invalid-input)
+    (try! (as-contract (stx-transfer? amount tx-sender contract-owner)))
+    (ok amount)
+  )
+)
